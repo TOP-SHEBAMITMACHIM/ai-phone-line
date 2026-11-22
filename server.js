@@ -82,6 +82,18 @@ async function downloadRecording(path) {
   return buf;
 }
 
+// ימות לא יוצרת תיקייה להקלטות בעצמה - יוצרים אותה ע"י העלאת קובץ קטן
+async function ensureRecFolder() {
+  if (!YEMOT_TOKEN) return;
+  try {
+    const body = new URLSearchParams({ token: YEMOT_TOKEN, what: `ivr2:/${REC_FOLDER}/keep.ini`, contents: 'keep=1' });
+    const r = await fetch(`${YEMOT_API}UploadTextFile`, { method: 'POST', body });
+    console.log('תיקיית הקלטות:', (await r.text()).slice(0, 120));
+  } catch (e) {
+    console.error('יצירת תיקיית הקלטות נכשלה', e.message);
+  }
+}
+
 async function loadUsers() {
   if (!YEMOT_TOKEN) return;
   try {
@@ -379,5 +391,6 @@ http.createServer(async (req, res) => {
   }
 }).listen(PORT, async () => {
   console.log('השרת פועל על פורט', PORT);
+  await ensureRecFolder();
   await loadUsers();
 });
