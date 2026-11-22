@@ -61,7 +61,8 @@ function readDigits(msg, key, max, min, timeout) {
 
 function readRecord(msg, key, fileName) {
   // שם, שימוש בקיים, record, תיקייה, שם קובץ, תפריט אישור, שמירה בניתוק, שרשור, מינימום שניות, מקסימום שניות
-  return `read=${tts(msg)}=${key},no,record,${REC_FOLDER},${fileName},no,yes,no,1,90`;
+  // תיקייה ושם ריקים = ימות שומרת במיקום ברירת המחדל ומחזירה את הנתיב
+  return `read=${tts(msg)}=${key},no,record,,,no,yes,no,1,90`;
 }
 
 function say(msg) {
@@ -80,6 +81,26 @@ async function downloadRecording(path) {
     throw new Error('DownloadFile: ' + buf.toString('utf8'));
   }
   return buf;
+}
+
+// מחפש את ההקלטה האחרונה (עד 3 דקות) של המתקשר בתיקייה
+async function findLatestRecording(dir, digits) {
+  try {
+    const r = await fetch(`${YEMOT_API}GetIVR2Dir?token=${tok()}&path=${encodeURIComponent(dir)}&orderBy=mtime&orderDir=desc`);
+    const j = await r.json();
+    const files = (j.files || []).filter(f => /\.wav$/i.test(f.name) && (!digits || f.name.includes(digits)));
+    const now = Date.now() / 1000;
+    const recent = files.filter(f => {
+      const m = String(f.name).match(/(\d{10})\.wav$/);
+      return !m || now - Number(m[1]) < 180;
+    });
+    const pick = recent[0];
+    if (!pick) { console.log('אין הקלטה עדכנית ב:', dir, j.responseStatus || '', j.message || ''); return null; }
+    return pick.what || `${dir}/${pick.name}`;
+  } catch (e) {
+    console.log('GetIVR2Dir נכשל:', dir, e.message);
+    return null;
+  }
 }
 
 // ימות לא יוצרת תיקייה להקלטות בעצמה - יוצרים אותה ע"י העלאת קובץ קטן
@@ -261,6 +282,16 @@ async function handleYemot(q) {
       for (const p of candidates) {
         try { audio = await downloadRecording(p); console.log('הקלטה נמצאה ב:', p); break; }
         catch (e) { lastErr = e; console.log('לא נמצא:', p, e.message); }
+      }
+      if (!audio) {
+        // גיבוי: ימות לפעמים מעבירה את ההקלטה ל-ApiRecord או ל-Trash/ApiRecord
+        const digits = state.phone.replace(/\D/g, '');
+        for (const dir of ['ivr2:/ApiRecord', 'ivr2:/Trash/ApiRecord']) {
+          const f = await findLatestRecording(dir, digits);
+          if (!f) continue;
+          try { audio = await downloadRecording(f); console.log('הקלטה נמצאה ב:', f); break; }
+          catch (e) { lastErr = e; }
+        }
       }
       if (!audio) throw lastErr;
       const answer = await askGemini(state, audio);
