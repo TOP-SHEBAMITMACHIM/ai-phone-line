@@ -7,7 +7,13 @@ const { URL } = require('url');
 // ---------- הגדרות (משתני סביבה ב-Render) ----------
 const PORT = process.env.PORT || 3000;
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN || '';            // "מספר_מערכת:סיסמה" או מפתח API
-const GEMINI_KEYS = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2].filter(Boolean);
+// מפתחות Gemini: GEMINI_API_KEY, GEMINI_API_KEY_2 ... GEMINI_API_KEY_10, או כמה מופרדים בפסיק ב-GEMINI_API_KEYS
+const GEMINI_KEYS = [...new Set([
+  process.env.GEMINI_API_KEY,
+  ...Array.from({ length: 9 }, (_, i) => process.env[`GEMINI_API_KEY_${i + 2}`]),
+  ...String(process.env.GEMINI_API_KEYS || '').split(',')
+].map(k => (k || '').trim()).filter(Boolean))];
+console.log('מפתחות Gemini מוגדרים:', GEMINI_KEYS.length);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '15000', 10);
 const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
@@ -242,6 +248,15 @@ function touchUser(phone) {
 // ---------- Gemini ----------
 let lastGoodModel = null;
 const modelCooldown = new Map();
+// 503/504/404 = בעיה במודל עצמו (לכל המפתחות); 429 = נגמרה המכסה של מפתח מסוים בלבד
+function cooled(model, key) {
+  const now = Date.now();
+  return modelCooldown.get(model) > now || modelCooldown.get(model + '|' + key) > now;
+}
+function cool(model, key, status) {
+  const ms = status === 404 ? 24 * 3600e3 : 3 * 60e3;
+  modelCooldown.set(status === 429 ? model + '|' + key : model, Date.now() + ms);
+}
 let discoveredChat = [];
 let ttsModels = [];
 
@@ -306,7 +321,7 @@ function fetchSafe(url, opts) {
 async function geminiSpeak(text) {
   for (const key of GEMINI_KEYS) {
     for (const model of ttsModels) {
-      if (modelCooldown.get(model) > Date.now()) continue;
+      if (cooled(model, key)) continue;
       const t0 = Date.now();
       const r = await fetchSafe(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST',
@@ -323,7 +338,7 @@ async function geminiSpeak(text) {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         console.log(`TTS ${r.status} במודל ${model}:`, (j.error?.message || '').slice(0, 120));
-        if ([404, 429, 500, 503, 504].includes(r.status)) modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
+        if ([404, 429, 500, 503, 504].includes(r.status)) cool(model, key, r.status);
         continue;
       }
       const part = j.candidates?.[0]?.content?.parts?.find(p => p.inlineData || p.inline_data);
@@ -430,15 +445,16 @@ async function askGemini(state, audio) {
   let lastErr;
   for (const key of GEMINI_KEYS) {   // אם המכסה של המפתח הראשון נגמרה - עוברים לשני
     try {
-      let r, j;
+      let r = { ok: false, status: 429 }, j = { error: { message: 'כל המודלים במפתח הזה בהמתנה' } };
       // מודל עמוס (429/5xx) או לא קיים (404) - עוברים מיד למודל הבא ומקררים אותו לכמה דקות
       for (const model of models) {
+        if (cooled(model, key)) continue;
         const t0 = Date.now();
         try {
           ({ r, j } = await call(key, model));
         } catch (e) {
           console.log(`Gemini לא ענה בזמן במודל ${model} (${e.name}) - עובר לבא`);
-          modelCooldown.set(model, Date.now() + 3 * 60e3);
+          cool(model, key, 504);
           r = { ok: false, status: 504 }; j = { error: { message: 'timeout' } };
           continue;
         }
@@ -450,7 +466,7 @@ async function askGemini(state, audio) {
         }
         if (![404, 429, 500, 503].includes(r.status)) break;
         console.log(`Gemini ${r.status} במודל ${model} - עובר לבא`);
-        modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
+        cool(model, key, r.status);
       }
       if (!r.ok) throw new Error(`Gemini ${r.status}: ${j.error && j.error.message}`);
       const text = j.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
