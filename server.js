@@ -237,7 +237,20 @@ async function handleYemot(q) {
 
   if (state.await === 'rec') {
     try {
-      const audio = await downloadRecording(`ivr2:/${REC_FOLDER}/${state.file}.wav`);
+      console.log('ערך הקלטה מימות:', value);
+      const candidates = [];
+      if (/[\/.]/.test(value)) {
+        const v = value.replace(/^ivr2:/, '');
+        candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v));
+        if (!/\.\w{3,4}$/.test(v)) candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v) + '.wav');
+      }
+      candidates.push(`ivr2:/${REC_FOLDER}/${state.file}.wav`, `ivr2:${REC_FOLDER}/${state.file}.wav`, `ivr2:/${state.file}.wav`);
+      let audio, lastErr;
+      for (const p of candidates) {
+        try { audio = await downloadRecording(p); console.log('הקלטה נמצאה ב:', p); break; }
+        catch (e) { lastErr = e; console.log('לא נמצא:', p, e.message); }
+      }
+      if (!audio) throw lastErr;
       const answer = await askGemini(state, audio);
       users[state.phone].questions++;
       saveUsers();
@@ -334,7 +347,10 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/yemot') {
       const q = Object.fromEntries(url.searchParams);
       if (req.method === 'POST') Object.assign(q, Object.fromEntries(new URLSearchParams(await readBody(req))));
+      const { ApiPhone, ...rest } = q;
+      console.log('בקשה מימות:', JSON.stringify(rest));
       const out = await handleYemot(q);
+      console.log('תשובה לימות:', out.slice(0, 300));
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end(out);
     }
