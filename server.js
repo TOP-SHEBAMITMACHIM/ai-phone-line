@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN || '';            // "מספר_מערכת:סיסמה" או מפתח API
 const GEMINI_KEYS = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2].filter(Boolean);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
+const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD || '';   // אם לא הוגדר - מקש 5 לא פעיל
 const MAX_WORDS = parseInt(process.env.MAX_WORDS || '80', 10);
@@ -208,10 +208,15 @@ async function askGemini(state, audio) {
   for (const key of GEMINI_KEYS) {   // אם המכסה של המפתח הראשון נגמרה - עוברים לשני
     try {
       let r, j;
-      for (const model of models) {
-        ({ r, j } = await call(key, model));
-        if (r.status !== 404) break;
-        console.log('מודל לא זמין:', model);
+      // 404 = מודל לא קיים, 429/500/503 = עומס/מכסה - מנסים שוב ואז עוברים למודל הבא
+      outer: for (const model of models) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          ({ r, j } = await call(key, model));
+          if (r.ok || ![404, 429, 500, 503].includes(r.status)) break outer;
+          console.log(`Gemini ${r.status} במודל ${model} (ניסיון ${attempt + 1})`);
+          if (r.status === 404) break;
+          if (attempt === 0) await new Promise(res => setTimeout(res, 800));
+        }
       }
       if (!r.ok) throw new Error(`Gemini ${r.status}: ${j.error && j.error.message}`);
       const text = j.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
@@ -322,8 +327,8 @@ async function handleYemot(q) {
         }
       }
       if (!audio) throw lastErr;
+      deleteFile(usedPath);   // ההקלטה כבר בזיכרון - מוחקים מהקו גם אם Gemini ייכשל
       const answer = await askGemini(state, audio);
-      deleteFile(usedPath);
       users[state.phone].questions++;
       saveUsers();
       return `${say(answer)}&${mainMenu(state, 'לשאלה נוספת')}`;
