@@ -40,6 +40,9 @@ const OPEN_RULES = `ענה באופן מועיל ומכבד על כל שאלה.`
 
 // ---------- נתונים ----------
 let users = {};           // phone -> { calls, questions, bypass, blocked, first, last }
+let qlog = [];            // [{ t, phone, q, a, open }] - יומן שאלות ותשובות
+const LOG_FILE = 'ivr2:/ai_data/questions.ini';
+const LOG_MAX = parseInt(process.env.LOG_MAX || '1000', 10);
 const calls = new Map();  // callId -> מצב השיחה
 
 // ---------- פונקציות עזר לימות ----------
@@ -49,12 +52,62 @@ function tok() {
 
 // ימות מפרידה הודעות בנקודה ופרמטרים בפסיק/שווה/אמפרסנד - מנקים את הטקסט ומפצלים למשפטים
 function tts(text) {
-  const parts = String(text)
+  const parts = splitSentences(text);
+  return parts.map(p => promptFile(p) || 't-' + p).join('.') || 't-אין תשובה';
+}
+
+function splitSentences(text) {
+  return String(text)
     .replace(/[*#_`~"'<>\[\](){}|\\/]/g, ' ')
     .split(/[.!?\n:;]+/)
     .map(s => s.replace(/[,=&\-]/g, ' ').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
-  return parts.map(p => 't-' + p).join('.') || 't-אין תשובה';
+}
+
+// ---------- הודעות קבועות מוקלטות בקול Gemini ----------
+// כל משפט קבוע מוקלט פעם אחת, נשמר בקו בשם p_<hash>.wav ומושמע במקום הקריין של ימות
+const PROMPTS = [
+  WELCOME, 'לשאלה הקישו 1, להגדרות מתקדמות הקישו 5', 'הסינון כבוי בשיחה זו', 'הגישה לקו זה נחסמה',
+  'הייתה תקלה, נסו שוב', 'לשאלה נוספת', 'אנא שאלו את שאלתכם אחרי הצליל, ובסיום הקישו סולמית',
+  'האפשרות ננעלה בשיחה זו', 'הקישו סיסמה', 'בחירה שגויה', 'הסינון בוטל לשיחה זו', 'הסינון הופעל מחדש',
+  'סיסמה שגויה', 'רגע אני חושב', 'עוד רגע', 'הייתה תקלה בשרת'
+];
+const readyPrompts = new Set();
+
+function promptName(sentence) {
+  return 'p_' + require('crypto').createHash('sha1').update(TTS_VOICE + '|' + sentence).digest('hex').slice(0, 10);
+}
+
+function promptFile(sentence) {
+  const n = promptName(sentence);
+  return readyPrompts.has(n) ? 'f-' + n : null;
+}
+
+async function preparePrompts() {
+  if (!YEMOT_TOKEN || !USE_GEMINI_TTS || !ttsModels.length) return;
+  try {
+    const r = await fetch(`${YEMOT_API}GetIVR2Dir?token=${tok()}&path=${encodeURIComponent('ivr2:/')}`);
+    const j = await r.json();
+    for (const f of j.files || []) if (/^p_[0-9a-f]{10}\.wav$/.test(f.name)) readyPrompts.add(f.name.slice(0, -4));
+  } catch (e) {
+    console.log('בדיקת הודעות קיימות נכשלה:', e.message);
+  }
+  const needed = [...new Set(PROMPTS.flatMap(splitSentences))];
+  let made = 0;
+  for (const sentence of needed) {
+    const n = promptName(sentence);
+    if (readyPrompts.has(n)) continue;
+    try {
+      const wav = await geminiSpeak(sentence);
+      if (!wav) { console.log('הקלטת הודעה נכשלה:', sentence); continue; }
+      await uploadAudio(`ivr2:/${n}.wav`, wav);
+      readyPrompts.add(n);
+      made++;
+    } catch (e) {
+      console.log('הקלטת הודעה נכשלה:', sentence, e.message);
+    }
+  }
+  console.log(`הודעות בקול Gemini: ${readyPrompts.size} מוכנות (${made} חדשות)`);
 }
 
 function readDigits(msg, key, max, min, timeout) {
@@ -135,6 +188,34 @@ async function loadUsers() {
   } catch (e) {
     console.log('לא נמצא קובץ משתמשים קודם (תקין בהפעלה ראשונה)');
   }
+}
+
+async function loadLog() {
+  if (!YEMOT_TOKEN) return;
+  try {
+    const r = await fetch(`${YEMOT_API}GetTextFile?token=${tok()}&what=${encodeURIComponent(LOG_FILE)}`);
+    const j = await r.json();
+    if (j.contents) qlog = JSON.parse(j.contents);
+    console.log('נטענו', qlog.length, 'שאלות ליומן');
+  } catch (e) {
+    console.log('אין יומן שאלות קודם');
+  }
+}
+
+let logTimer = null;
+function addLog(entry) {
+  qlog.push(entry);
+  if (qlog.length > LOG_MAX) qlog = qlog.slice(-LOG_MAX);
+  if (!YEMOT_TOKEN) return;
+  clearTimeout(logTimer);
+  logTimer = setTimeout(async () => {
+    try {
+      const body = new URLSearchParams({ token: YEMOT_TOKEN, what: LOG_FILE, contents: JSON.stringify(qlog) });
+      await fetch(`${YEMOT_API}UploadTextFile`, { method: 'POST', body });
+    } catch (e) {
+      console.error('שמירת יומן נכשלה', e.message);
+    }
+  }, 3000);
 }
 
 let saveTimer = null;
@@ -379,7 +460,7 @@ async function askGemini(state, audio) {
       state.history.push({ role: 'user', parts: [{ text: out.question || '(שאלה מוקלטת)' }] });
       state.history.push({ role: 'model', parts: [{ text: out.answer }] });
       state.history = state.history.slice(-12);
-      return out.answer;
+      return out;
     } catch (e) {
       lastErr = e;
       console.error(e.message);
@@ -394,7 +475,7 @@ function mainMenu(state, prefix = '') {
   state.await = 'menu';
   state.key = 'm' + state.turn;
   const filterLine = state.unfiltered && !prefix ? 'הסינון כבוי בשיחה זו' : '';
-  const msg = `${prefix}. ${filterLine}. לשאלה הקישו 1. להגדרות מתקדמות הקישו 5`;
+  const msg = `${prefix}. ${filterLine}. לשאלה הקישו 1, להגדרות מתקדמות הקישו 5`;
   return readDigits(msg, state.key, 1, 1, 10);
 }
 
@@ -488,8 +569,8 @@ async function handleYemot(q) {
 }
 
 function waitResponse(first) {
-  if (musicReady) return `id_list_message=${first ? 't-רגע אני חושב.' : ''}f-wait_music&go_to_folder=/`;
-  return `id_list_message=t-${first ? 'רגע אני חושב' : 'עוד רגע'}&go_to_folder=/`;
+  if (musicReady) return `id_list_message=${first ? tts('רגע אני חושב') + '.' : ''}f-wait_music&go_to_folder=/`;
+  return `id_list_message=${tts(first ? 'רגע אני חושב' : 'עוד רגע')}&go_to_folder=/`;
 }
 
 async function getRecording(state, value) {
@@ -523,7 +604,9 @@ async function getRecording(state, value) {
 async function processQuestion(state, value, callId) {
   const t0 = Date.now();
   const audio = await getRecording(state, value);
-  const answer = await askGemini(state, audio);
+  const out = await askGemini(state, audio);
+  const answer = out.answer;
+  addLog({ t: new Date().toISOString(), phone: state.phone, q: out.question || '', a: answer, open: !!state.unfiltered });
   users[state.phone].questions++;
   saveUsers();
   if (USE_GEMINI_TTS && ttsModels.length && YEMOT_TOKEN) {
@@ -584,44 +667,71 @@ function fmt(d) {
   try { return new Date(d).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' }); } catch { return d; }
 }
 
+const ADMIN_CSS = `
+:root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--bad:#fde8e8;--warn:#fff4d6}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--text:#e7eaf0;--muted:#9aa3b2;--line:#2a3140;--accent:#60a5fa;--bad:#3b1d1d;--warn:#3a2f12}}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;padding:16px}
+h1{font-size:22px;margin:0 0 12px}
+nav{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+nav a{padding:8px 14px;border-radius:8px;border:1px solid var(--line);color:var(--text);text-decoration:none;background:var(--card)}
+nav a.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.stat b{display:block;font-size:28px;color:var(--accent)}.stat span{color:var(--muted);font-size:14px}
+.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;min-width:640px}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:right;font-size:14px;vertical-align:top}
+th{color:var(--muted);font-weight:600}tr.blocked{background:var(--bad)}tr.open{background:var(--warn)}
+td.txt{min-width:220px;max-width:480px;white-space:pre-wrap;line-height:1.5}
+button{background:transparent;color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+input{padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);width:220px;max-width:100%}
+a{color:var(--accent)}.muted{color:var(--muted);font-size:13px}`;
+
+function adminShell(tab, body) {
+  return `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>ניהול קו AI</title><style>${ADMIN_CSS}</style></head><body>
+<h1>ניהול קו הבינה המלאכותית</h1>
+<nav><a href="/admin" class="${tab === 'users' ? 'on' : ''}">משתמשים</a><a href="/admin/questions" class="${tab === 'q' ? 'on' : ''}">שאלות ותשובות</a></nav>
+${body}</body></html>`;
+}
+
+function questionsPage(phone) {
+  const items = qlog.filter(e => !phone || e.phone === phone).slice().reverse();
+  const rows = items.map(e => `
+    <tr class="${e.open ? 'open' : ''}">
+      <td>${esc(fmt(e.t))}</td>
+      <td dir="ltr"><a href="/admin/questions?phone=${encodeURIComponent(e.phone)}">${esc(e.phone)}</a></td>
+      <td class="txt">${esc(e.q || '—')}</td><td class="txt">${esc(e.a)}</td>
+      <td>${e.open ? 'כבוי' : 'פעיל'}</td>
+    </tr>`).join('');
+  return adminShell('q', `
+${phone ? `<p>שאלות של <b dir="ltr">${esc(phone)}</b> · <a href="/admin/questions">הצג הכל</a></p>` : ''}
+<p><input placeholder="חיפוש בשאלות ובתשובות" oninput="const v=this.value;for(const r of document.querySelectorAll('tbody tr'))r.style.display=r.textContent.includes(v)?'':'none'">
+<span class="muted"> ${items.length} שאלות · שורות מודגשות = נשאלו כשהסינון כבוי</span></p>
+<div class="wrap"><table><thead><tr><th>זמן</th><th>טלפון</th><th>שאלה</th><th>תשובה</th><th>סינון</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="5">עדיין אין שאלות</td></tr>'}</tbody></table></div>`);
+}
+
 function adminPage() {
   const list = Object.entries(users).sort((a, b) => (b[1].last || '').localeCompare(a[1].last || ''));
   const totalCalls = list.reduce((s, [, u]) => s + u.calls, 0);
   const totalQ = list.reduce((s, [, u]) => s + u.questions, 0);
   const rows = list.map(([phone, u]) => `
     <tr class="${u.blocked ? 'blocked' : ''}">
-      <td dir="ltr">${esc(phone)}</td><td>${u.calls}</td><td>${u.questions}</td><td>${u.bypass}</td>
+      <td dir="ltr">${esc(phone)}</td><td>${u.calls}</td><td><a href="/admin/questions?phone=${encodeURIComponent(phone)}">${u.questions}</a></td><td>${u.bypass}</td>
       <td>${esc(fmt(u.first))}</td><td>${esc(fmt(u.last))}</td>
       <td><form method="post" action="/admin/toggle"><input type="hidden" name="phone" value="${esc(phone)}">
         <button>${u.blocked ? 'שחרור חסימה' : 'חסימה'}</button></form></td>
     </tr>`).join('');
-  return `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>ניהול קו AI</title>
-<style>
-:root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--bad:#fde8e8}
-@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--text:#e7eaf0;--muted:#9aa3b2;--line:#2a3140;--accent:#60a5fa;--bad:#3b1d1d}}
-body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;padding:16px}
-h1{font-size:22px;margin:0 0 16px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
-.stat b{display:block;font-size:28px;color:var(--accent)}.stat span{color:var(--muted);font-size:14px}
-.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
-table{border-collapse:collapse;width:100%;min-width:640px}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:right;font-size:14px}
-th{color:var(--muted);font-weight:600}tr.blocked{background:var(--bad)}
-button{background:transparent;color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
-input{padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);width:220px}
-</style></head><body>
-<h1>ניהול קו הבינה המלאכותית</h1>
+  return adminShell('users', `
 <div class="stats">
   <div class="stat"><b>${list.length}</b><span>משתמשים</span></div>
   <div class="stat"><b>${totalCalls}</b><span>שיחות</span></div>
   <div class="stat"><b>${totalQ}</b><span>שאלות</span></div>
   <div class="stat"><b>${calls.size}</b><span>שיחות פעילות עכשיו</span></div>
 </div>
-<p><input id="f" placeholder="חיפוש מספר טלפון" oninput="for(const r of document.querySelectorAll('tbody tr'))r.style.display=r.cells[0].textContent.includes(this.value)?'':'none'"></p>
+<p><input placeholder="חיפוש מספר טלפון" oninput="for(const r of document.querySelectorAll('tbody tr'))r.style.display=r.cells[0].textContent.includes(this.value)?'':'none'"></p>
 <div class="wrap"><table><thead><tr><th>טלפון</th><th>שיחות</th><th>שאלות</th><th>ביטולי סינון</th><th>שיחה ראשונה</th><th>שיחה אחרונה</th><th></th></tr></thead>
-<tbody>${rows || '<tr><td colspan="7">עדיין אין משתמשים</td></tr>'}</tbody></table></div>
-</body></html>`;
+<tbody>${rows || '<tr><td colspan="7">עדיין אין משתמשים</td></tr>'}</tbody></table></div>`);
 }
 
 // ---------- שרת ----------
@@ -673,6 +783,10 @@ http.createServer(async (req, res) => {
         res.writeHead(303, { Location: '/admin' });
         return res.end();
       }
+      if (url.pathname === '/admin/questions') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(questionsPage(url.searchParams.get('phone') || ''));
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(adminPage());
     }
@@ -686,5 +800,6 @@ http.createServer(async (req, res) => {
   }
 }).listen(PORT, async () => {
   console.log('השרת פועל על פורט', PORT);
-  await Promise.all([ensureRecFolder(), loadUsers(), discoverModels(), ensureWaitMusic()]);
+  await Promise.all([ensureRecFolder(), loadUsers(), loadLog(), discoverModels(), ensureWaitMusic()]);
+  preparePrompts();
 });
