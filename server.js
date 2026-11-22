@@ -8,7 +8,8 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 3000;
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN || '';            // "מספר_מערכת:סיסמה" או מפתח API
 const GEMINI_KEYS = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2].filter(Boolean);
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD || '';   // אם לא הוגדר - מקש 5 לא פעיל
 const MAX_WORDS = parseInt(process.env.MAX_WORDS || '80', 10);
@@ -71,6 +72,14 @@ function say(msg) {
 
 function hangup(msg) {
   return `${say(msg)}&go_to_folder=hangup`;
+}
+
+// מחיקת ההקלטה אחרי השימוש כדי שלא יצטברו קבצים בקו
+function deleteFile(path) {
+  if (!path) return;
+  fetch(`${YEMOT_API}FileAction?token=${tok()}&action=delete&what=${encodeURIComponent(path)}`)
+    .then(r => r.text()).then(t => console.log('מחיקת הקלטה:', path, t.slice(0, 80)))
+    .catch(e => console.log('מחיקה נכשלה:', e.message));
 }
 
 async function downloadRecording(path) {
@@ -174,17 +183,36 @@ async function askGemini(state, audio) {
       }
     }
   };
-  if (/2\.5-flash/.test(GEMINI_MODEL)) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  // מודל שלא זמין (404) - עוברים למודל הבא ברשימה
+  const models = [...new Set([GEMINI_MODEL, ...FALLBACK_MODELS])];
+
+  async function call(key, model) {
+    const b = JSON.parse(JSON.stringify(body));
+    if (/2\.5-flash/.test(model)) b.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    else if (/gemini-3/.test(model)) b.generationConfig.thinkingConfig = { thinkingLevel: 'low' };
+    let r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b)
+    });
+    let j = await r.json();
+    if (r.status === 400 && /thinking/i.test(j.error?.message || '')) {   // המודל לא תומך בהגדרת חשיבה
+      delete b.generationConfig.thinkingConfig;
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b)
+      });
+      j = await r.json();
+    }
+    return { r, j };
+  }
 
   let lastErr;
   for (const key of GEMINI_KEYS) {   // אם המכסה של המפתח הראשון נגמרה - עוברים לשני
     try {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(body)
-      });
-      const j = await r.json();
+      let r, j;
+      for (const model of models) {
+        ({ r, j } = await call(key, model));
+        if (r.status !== 404) break;
+        console.log('מודל לא זמין:', model);
+      }
       if (!r.ok) throw new Error(`Gemini ${r.status}: ${j.error && j.error.message}`);
       const text = j.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
       let out;
@@ -278,9 +306,9 @@ async function handleYemot(q) {
         if (!/\.\w{3,4}$/.test(v)) candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v) + '.wav');
       }
       candidates.push(`ivr2:/${REC_FOLDER}/${state.file}.wav`, `ivr2:${REC_FOLDER}/${state.file}.wav`, `ivr2:/${state.file}.wav`);
-      let audio, lastErr;
+      let audio, lastErr, usedPath;
       for (const p of candidates) {
-        try { audio = await downloadRecording(p); console.log('הקלטה נמצאה ב:', p); break; }
+        try { audio = await downloadRecording(p); usedPath = p; console.log('הקלטה נמצאה ב:', p); break; }
         catch (e) { lastErr = e; console.log('לא נמצא:', p, e.message); }
       }
       if (!audio) {
@@ -289,12 +317,13 @@ async function handleYemot(q) {
         for (const dir of ['ivr2:/ApiRecord', 'ivr2:/Trash/ApiRecord']) {
           const f = await findLatestRecording(dir, digits);
           if (!f) continue;
-          try { audio = await downloadRecording(f); console.log('הקלטה נמצאה ב:', f); break; }
+          try { audio = await downloadRecording(f); usedPath = f; console.log('הקלטה נמצאה ב:', f); break; }
           catch (e) { lastErr = e; }
         }
       }
       if (!audio) throw lastErr;
       const answer = await askGemini(state, audio);
+      deleteFile(usedPath);
       users[state.phone].questions++;
       saveUsers();
       return `${say(answer)}&${mainMenu(state, 'לשאלה נוספת')}`;
