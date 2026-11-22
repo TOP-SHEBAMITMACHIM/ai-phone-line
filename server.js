@@ -314,12 +314,30 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ---------- ממשק ניהול ----------
+const crypto = require('crypto');
+function adminToken() {
+  return crypto.createHmac('sha256', ADMIN_PASSWORD + '|ai-line').update('admin').digest('hex');
+}
+
 function checkAdmin(req) {
   if (!ADMIN_PASSWORD) return false;
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) return false;
-  const [, pass] = Buffer.from(h.slice(6), 'base64').toString().split(':');
-  return pass === ADMIN_PASSWORD;
+  const m = (req.headers.cookie || '').match(/(?:^|;\s*)adm=([a-f0-9]+)/);
+  return !!m && m[1] === adminToken();
+}
+
+function loginPage(error) {
+  return `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>כניסה לניהול</title>
+<style>:root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--line:#e5e7eb;--accent:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--text:#e7eaf0;--line:#2a3140;--accent:#60a5fa}}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;display:grid;place-items:center;min-height:100vh;padding:16px;box-sizing:border-box}
+form{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:24px;width:100%;max-width:320px;display:grid;gap:12px}
+input,button{padding:10px;border-radius:8px;border:1px solid var(--line);font-size:16px;background:var(--card);color:var(--text)}
+button{background:var(--accent);color:#fff;border:0;cursor:pointer}.err{color:#dc2626}</style></head><body>
+<form method="post" action="/admin/login"><h2 style="margin:0">ניהול קו AI</h2>
+${error ? `<div class="err">${error}</div>` : ''}
+<input type="password" name="password" placeholder="סיסמת ניהול" autofocus required>
+<button>כניסה</button></form></body></html>`;
 }
 
 function esc(s) {
@@ -399,9 +417,19 @@ http.createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/admin')) {
+      if (url.pathname === '/admin/login' && req.method === 'POST') {
+        const pass = new URLSearchParams(await readBody(req)).get('password') || '';
+        if (ADMIN_PASSWORD && pass === ADMIN_PASSWORD) {
+          res.writeHead(303, { Location: '/admin', 'Set-Cookie': `adm=${adminToken()}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000` });
+          return res.end();
+        }
+        await new Promise(r => setTimeout(r, 1000));
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(loginPage(ADMIN_PASSWORD ? 'סיסמה שגויה' : 'יש להגדיר ADMIN_PASSWORD ב-Render'));
+      }
       if (!checkAdmin(req)) {
-        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="admin", charset="UTF-8"', 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end(ADMIN_PASSWORD ? 'נדרשת סיסמה' : 'יש להגדיר ADMIN_PASSWORD ב-Render');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(loginPage(''));
       }
       if (url.pathname === '/admin/toggle' && req.method === 'POST') {
         const phone = new URLSearchParams(await readBody(req)).get('phone');
