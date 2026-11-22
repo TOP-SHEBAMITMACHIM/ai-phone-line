@@ -158,6 +158,142 @@ function touchUser(phone) {
 }
 
 // ---------- Gemini ----------
+let lastGoodModel = null;
+const modelCooldown = new Map();
+let discoveredChat = [];
+let ttsModels = [];
+
+// סדר מודלים: קודם זה שעבד לאחרונה, אחר כך השאר; מדלגים על מודלים עמוסים
+function orderedModels() {
+  const all = [...new Set([lastGoodModel, GEMINI_MODEL, ...FALLBACK_MODELS, ...discoveredChat].filter(Boolean))];
+  const now = Date.now();
+  const ready = all.filter(m => !(modelCooldown.get(m) > now));
+  return ready.length ? ready : all;
+}
+
+// בהפעלה: בודקים אילו מודלים זמינים למפתח (כולל מודלי קול)
+async function discoverModels() {
+  if (!GEMINI_KEYS[0]) return;
+  try {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', { headers: { 'x-goog-api-key': GEMINI_KEYS[0] } });
+    const j = await r.json();
+    const names = (j.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map(m => m.name.replace(/^models\//, ''));
+    ttsModels = names.filter(n => /tts/i.test(n)).sort((a, b) => (/flash/.test(b) - /flash/.test(a)) || (/preview/.test(a) - /preview/.test(b)));
+    if (process.env.TTS_MODEL) ttsModels.unshift(process.env.TTS_MODEL);
+    discoveredChat = names.filter(n => /^gemini-.*flash/.test(n) && !/tts|image|live|audio|embed|computer|robotics|thinking/i.test(n));
+    console.log('מודלי צ\'אט זמינים:', discoveredChat.join(', '));
+    console.log('מודלי קול זמינים:', ttsModels.join(', ') || 'אין');
+  } catch (e) {
+    console.log('בדיקת מודלים נכשלה:', e.message);
+  }
+}
+
+// ---------- קול: Gemini TTS ----------
+const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
+const USE_GEMINI_TTS = process.env.USE_GEMINI_TTS !== 'false';
+
+function pcmToWav8k(pcm, rate) {
+  // ממירים ל-8kHz (איכות טלפון) כדי שההעלאה לימות תהיה מהירה
+  const step = Math.max(1, Math.round(rate / 8000));
+  const inSamples = pcm.length >> 1;
+  const outSamples = Math.floor(inSamples / step);
+  const out = Buffer.alloc(44 + outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    let sum = 0;
+    for (let k = 0; k < step; k++) sum += pcm.readInt16LE((i * step + k) * 2);
+    out.writeInt16LE(Math.round(sum / step), 44 + i * 2);
+  }
+  writeWavHeader(out, rate / step, outSamples);
+  return out;
+}
+
+function writeWavHeader(buf, rate, samples) {
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + samples * 2, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(rate, 24); buf.writeUInt32LE(rate * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write('data', 36); buf.writeUInt32LE(samples * 2, 40);
+}
+
+async function geminiSpeak(text) {
+  for (const key of GEMINI_KEYS) {
+    for (const model of ttsModels) {
+      if (modelCooldown.get(model) > Date.now()) continue;
+      const t0 = Date.now();
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `הקרא בעברית, בקול חם, ברור ובקצב נעים: ${text}` }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
+          }
+        })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.log(`TTS ${r.status} במודל ${model}:`, (j.error?.message || '').slice(0, 120));
+        if ([404, 429, 500, 503].includes(r.status)) modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
+        continue;
+      }
+      const part = j.candidates?.[0]?.content?.parts?.find(p => p.inlineData || p.inline_data);
+      const data = part && (part.inlineData || part.inline_data);
+      if (!data) continue;
+      const rate = parseInt((String(data.mimeType || data.mime_type).match(/rate=(\d+)/) || [])[1] || '24000', 10);
+      console.log(`TTS מוכן תוך ${Date.now() - t0}ms (${model})`);
+      return pcmToWav8k(Buffer.from(data.data, 'base64'), rate);
+    }
+  }
+  return null;
+}
+
+async function uploadAudio(path, wav) {
+  const form = new FormData();
+  form.append('token', YEMOT_TOKEN);
+  form.append('path', path);
+  form.append('convertAudio', '1');
+  form.append('file', new Blob([wav], { type: 'audio/wav' }), path.split('/').pop());
+  const r = await fetch(`${YEMOT_API}UploadFile`, { method: 'POST', body: form });
+  const t = await r.text();
+  if (!/"OK"/.test(t)) throw new Error('UploadFile: ' + t.slice(0, 150));
+}
+
+// ---------- מוזיקת המתנה (מנגינה מקורית שנוצרת בקוד) ----------
+let musicReady = false;
+function makeWaitMusic() {
+  const rate = 8000, beat = 0.25;
+  // ארפג'יו רגוע: דו מז'ור - לה מינור - פה מז'ור - סול מז'ור
+  const chords = [[261.6, 329.6, 392.0, 523.3], [220.0, 261.6, 329.6, 440.0], [174.6, 220.0, 261.6, 349.2], [196.0, 246.9, 293.7, 392.0]];
+  const notes = chords.flatMap(c => [c[0], c[1], c[2], c[3], c[2], c[1]]);
+  const samples = Math.floor(notes.length * beat * rate);
+  const buf = Buffer.alloc(44 + samples * 2);
+  for (let i = 0; i < samples; i++) {
+    const t = i / rate;
+    const n = Math.floor(t / beat);
+    const local = t - n * beat;
+    const f = notes[n];
+    const env = Math.exp(-local * 6) * Math.min(1, local * 200);
+    const bass = chords[Math.floor(n / 6)][0] / 2;
+    const v = 0.28 * env * (Math.sin(2 * Math.PI * f * t) + 0.3 * Math.sin(4 * Math.PI * f * t)) + 0.08 * Math.sin(2 * Math.PI * bass * t);
+    buf.writeInt16LE(Math.max(-32767, Math.min(32767, Math.round(v * 32767))), 44 + i * 2);
+  }
+  writeWavHeader(buf, rate, samples);
+  return buf;
+}
+
+async function ensureWaitMusic() {
+  if (!YEMOT_TOKEN) return;
+  try {
+    await uploadAudio('ivr2:/wait_music.wav', makeWaitMusic());
+    musicReady = true;
+    console.log('מוזיקת המתנה הועלתה');
+  } catch (e) {
+    console.log('העלאת מוזיקה נכשלה:', e.message);
+  }
+}
+
 async function askGemini(state, audio) {
   const system = BASE_RULES + '\n\n' + (state.unfiltered ? OPEN_RULES : FILTER_RULES);
   const body = {
@@ -183,8 +319,7 @@ async function askGemini(state, audio) {
       }
     }
   };
-  // מודל שלא זמין (404) - עוברים למודל הבא ברשימה
-  const models = [...new Set([GEMINI_MODEL, ...FALLBACK_MODELS])];
+  const models = orderedModels();
 
   async function call(key, model) {
     const b = JSON.parse(JSON.stringify(body));
@@ -208,15 +343,19 @@ async function askGemini(state, audio) {
   for (const key of GEMINI_KEYS) {   // אם המכסה של המפתח הראשון נגמרה - עוברים לשני
     try {
       let r, j;
-      // 404 = מודל לא קיים, 429/500/503 = עומס/מכסה - מנסים שוב ואז עוברים למודל הבא
-      outer: for (const model of models) {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          ({ r, j } = await call(key, model));
-          if (r.ok || ![404, 429, 500, 503].includes(r.status)) break outer;
-          console.log(`Gemini ${r.status} במודל ${model} (ניסיון ${attempt + 1})`);
-          if (r.status === 404) break;
-          if (attempt === 0) await new Promise(res => setTimeout(res, 800));
+      // מודל עמוס (429/5xx) או לא קיים (404) - עוברים מיד למודל הבא ומקררים אותו לכמה דקות
+      for (const model of models) {
+        const t0 = Date.now();
+        ({ r, j } = await call(key, model));
+        if (r.ok) {
+          if (lastGoodModel !== model) console.log('מודל פעיל:', model);
+          lastGoodModel = model;
+          console.log(`Gemini ענה תוך ${Date.now() - t0}ms (${model})`);
+          break;
         }
+        if (![404, 429, 500, 503].includes(r.status)) break;
+        console.log(`Gemini ${r.status} במודל ${model} - עובר לבא`);
+        modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
       }
       if (!r.ok) throw new Error(`Gemini ${r.status}: ${j.error && j.error.message}`);
       const text = j.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
@@ -250,6 +389,8 @@ async function handleYemot(q) {
   const phone = String(q.ApiPhone || 'לא ידוע');
 
   if (q.hangup === 'yes') {
+    const st = calls.get(callId);
+    if (st && st.lastTts) deleteFile(st.lastTts);
     calls.delete(callId);
     return '';
   }
@@ -265,6 +406,25 @@ async function handleYemot(q) {
     return mainMenu(state, WELCOME);
   }
   state.at = Date.now();
+
+  if (state.await === 'thinking') {
+    if (!state.result) {
+      if (Date.now() - state.jobStart > 90000) {
+        state.result = { error: new Error('timeout') };
+      } else {
+        return waitResponse(false);
+      }
+    }
+    const r = state.result;
+    state.result = null;
+    if (state.lastTts) deleteFile(state.lastTts);
+    state.lastTts = r.file || null;
+    if (r.error) {
+      console.error('שגיאה בטיפול בשאלה:', r.error.message);
+      return mainMenu(state, 'הייתה תקלה, נסו שוב');
+    }
+    return `id_list_message=${r.play}&${mainMenu(state, 'לשאלה נוספת')}`;
+  }
 
   const value = state.key ? q[state.key] : undefined;
   if (value === undefined || value === '') return mainMenu(state);
@@ -302,43 +462,71 @@ async function handleYemot(q) {
   }
 
   if (state.await === 'rec') {
-    try {
-      console.log('ערך הקלטה מימות:', value);
-      const candidates = [];
-      if (/[\/.]/.test(value)) {
-        const v = value.replace(/^ivr2:/, '');
-        candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v));
-        if (!/\.\w{3,4}$/.test(v)) candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v) + '.wav');
-      }
-      candidates.push(`ivr2:/${REC_FOLDER}/${state.file}.wav`, `ivr2:${REC_FOLDER}/${state.file}.wav`, `ivr2:/${state.file}.wav`);
-      let audio, lastErr, usedPath;
-      for (const p of candidates) {
-        try { audio = await downloadRecording(p); usedPath = p; console.log('הקלטה נמצאה ב:', p); break; }
-        catch (e) { lastErr = e; console.log('לא נמצא:', p, e.message); }
-      }
-      if (!audio) {
-        // גיבוי: ימות לפעמים מעבירה את ההקלטה ל-ApiRecord או ל-Trash/ApiRecord
-        const digits = state.phone.replace(/\D/g, '');
-        for (const dir of ['ivr2:/ApiRecord', 'ivr2:/Trash/ApiRecord']) {
-          const f = await findLatestRecording(dir, digits);
-          if (!f) continue;
-          try { audio = await downloadRecording(f); usedPath = f; console.log('הקלטה נמצאה ב:', f); break; }
-          catch (e) { lastErr = e; }
-        }
-      }
-      if (!audio) throw lastErr;
-      deleteFile(usedPath);   // ההקלטה כבר בזיכרון - מוחקים מהקו גם אם Gemini ייכשל
-      const answer = await askGemini(state, audio);
-      users[state.phone].questions++;
-      saveUsers();
-      return `${say(answer)}&${mainMenu(state, 'לשאלה נוספת')}`;
-    } catch (e) {
-      console.error('שגיאה בטיפול בשאלה:', e.message);
-      return mainMenu(state, 'הייתה תקלה, נסו שוב');
-    }
+    // מתחילים לעבד ברקע ומשמיעים מוזיקה; ימות חוזרת לשרת אחרי כל השמעה עד שהתשובה מוכנה
+    state.await = 'thinking';
+    state.jobStart = Date.now();
+    state.result = null;
+    processQuestion(state, value, callId).then(r => { state.result = r; }, e => { state.result = { error: e }; });
+    return waitResponse(true);
   }
 
   return mainMenu(state);
+}
+
+function waitResponse(first) {
+  if (musicReady) return `id_list_message=${first ? 't-רגע אני חושב.' : ''}f-wait_music`;
+  return `id_list_message=t-${first ? 'רגע אני חושב' : 'עוד רגע'}`;
+}
+
+async function getRecording(state, value) {
+  console.log('ערך הקלטה מימות:', value);
+  const candidates = [];
+  if (/[\/.]/.test(value)) {
+    const v = value.replace(/^ivr2:/, '');
+    candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v));
+    if (!/\.\w{3,4}$/.test(v)) candidates.push('ivr2:' + (v.startsWith('/') ? v : '/' + v) + '.wav');
+  }
+  let audio, lastErr, usedPath;
+  for (const p of candidates) {
+    try { audio = await downloadRecording(p); usedPath = p; break; }
+    catch (e) { lastErr = e; console.log('לא נמצא:', p, e.message); }
+  }
+  if (!audio) {
+    // גיבוי: ימות לפעמים מעבירה את ההקלטה ל-ApiRecord או ל-Trash/ApiRecord
+    const digits = state.phone.replace(/\D/g, '');
+    for (const dir of ['ivr2:/ApiRecord', 'ivr2:/Trash/ApiRecord']) {
+      const f = await findLatestRecording(dir, digits);
+      if (!f) continue;
+      try { audio = await downloadRecording(f); usedPath = f; break; }
+      catch (e) { lastErr = e; }
+    }
+  }
+  if (!audio) throw lastErr || new Error('ההקלטה לא נמצאה');
+  deleteFile(usedPath);
+  return audio;
+}
+
+async function processQuestion(state, value, callId) {
+  const t0 = Date.now();
+  const audio = await getRecording(state, value);
+  const answer = await askGemini(state, audio);
+  users[state.phone].questions++;
+  saveUsers();
+  if (USE_GEMINI_TTS && ttsModels.length && YEMOT_TOKEN) {
+    try {
+      const wav = await geminiSpeak(answer);
+      if (wav) {
+        const name = `tts_${callId.slice(0, 12)}_${state.turn}`;
+        await uploadAudio(`ivr2:/${name}.wav`, wav);
+        console.log(`תשובה מוכנה תוך ${Date.now() - t0}ms (קול Gemini)`);
+        return { play: `f-${name}`, file: `ivr2:/${name}.wav` };
+      }
+    } catch (e) {
+      console.log('קול Gemini נכשל, עובר לקול של ימות:', e.message);
+    }
+  }
+  console.log(`תשובה מוכנה תוך ${Date.now() - t0}ms (קול ימות)`);
+  return { play: tts(answer) };
 }
 
 // ניקוי שיחות ישנות
@@ -484,6 +672,5 @@ http.createServer(async (req, res) => {
   }
 }).listen(PORT, async () => {
   console.log('השרת פועל על פורט', PORT);
-  await ensureRecFolder();
-  await loadUsers();
+  await Promise.all([ensureRecFolder(), loadUsers(), discoverModels(), ensureWaitMusic()]);
 });
