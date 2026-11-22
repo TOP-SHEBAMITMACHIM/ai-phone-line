@@ -192,7 +192,7 @@ async function discoverModels() {
 }
 
 // ---------- קול: Gemini TTS ----------
-const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
+const TTS_VOICE = process.env.TTS_VOICE || 'Charon';   // קול גברי
 const USE_GEMINI_TTS = process.env.USE_GEMINI_TTS !== 'false';
 
 function pcmToWav8k(pcm, rate) {
@@ -232,7 +232,7 @@ async function geminiSpeak(text) {
         signal: AbortSignal.timeout(25000),
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: `הקרא בעברית, בקול חם, ברור ובקצב נעים: ${text}` }] }],
+          contents: [{ parts: [{ text }] }],   // רק הטקסט - אחרת המודל מקריא גם את ההנחיה
           generationConfig: {
             responseModalities: ['AUDIO'],
             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
