@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const YEMOT_TOKEN = process.env.YEMOT_TOKEN || '';            // "מספר_מערכת:סיסמה" או מפתח API
 const GEMINI_KEYS = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2].filter(Boolean);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '15000', 10);
 const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD || '';   // אם לא הוגדר - מקש 5 לא פעיל
@@ -216,13 +217,19 @@ function writeWavHeader(buf, rate, samples) {
   buf.write('data', 36); buf.writeUInt32LE(samples * 2, 40);
 }
 
+// fetch שלא זורק שגיאה בפסק זמן - מחזיר תשובה 504
+function fetchSafe(url, opts) {
+  return fetch(url, opts).catch(e => ({ ok: false, status: 504, json: async () => ({ error: { message: 'timeout ' + e.name } }) }));
+}
+
 async function geminiSpeak(text) {
   for (const key of GEMINI_KEYS) {
     for (const model of ttsModels) {
       if (modelCooldown.get(model) > Date.now()) continue;
       const t0 = Date.now();
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      const r = await fetchSafe(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST',
+        signal: AbortSignal.timeout(25000),
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({
           contents: [{ parts: [{ text: `הקרא בעברית, בקול חם, ברור ובקצב נעים: ${text}` }] }],
@@ -235,7 +242,7 @@ async function geminiSpeak(text) {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         console.log(`TTS ${r.status} במודל ${model}:`, (j.error?.message || '').slice(0, 120));
-        if ([404, 429, 500, 503].includes(r.status)) modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
+        if ([404, 429, 500, 503, 504].includes(r.status)) modelCooldown.set(model, Date.now() + (r.status === 404 ? 24 * 3600e3 : 3 * 60e3));
         continue;
       }
       const part = j.candidates?.[0]?.content?.parts?.find(p => p.inlineData || p.inline_data);
@@ -326,13 +333,13 @@ async function askGemini(state, audio) {
     if (/2\.5-flash/.test(model)) b.generationConfig.thinkingConfig = { thinkingBudget: 0 };
     else if (/gemini-3/.test(model)) b.generationConfig.thinkingConfig = { thinkingLevel: 'low' };
     let r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b)
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b), signal: AbortSignal.timeout(CHAT_TIMEOUT)
     });
     let j = await r.json();
     if (r.status === 400 && /thinking/i.test(j.error?.message || '')) {   // המודל לא תומך בהגדרת חשיבה
       delete b.generationConfig.thinkingConfig;
       r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b)
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(b), signal: AbortSignal.timeout(CHAT_TIMEOUT)
       });
       j = await r.json();
     }
@@ -346,7 +353,14 @@ async function askGemini(state, audio) {
       // מודל עמוס (429/5xx) או לא קיים (404) - עוברים מיד למודל הבא ומקררים אותו לכמה דקות
       for (const model of models) {
         const t0 = Date.now();
-        ({ r, j } = await call(key, model));
+        try {
+          ({ r, j } = await call(key, model));
+        } catch (e) {
+          console.log(`Gemini לא ענה בזמן במודל ${model} (${e.name}) - עובר לבא`);
+          modelCooldown.set(model, Date.now() + 3 * 60e3);
+          r = { ok: false, status: 504 }; j = { error: { message: 'timeout' } };
+          continue;
+        }
         if (r.ok) {
           if (lastGoodModel !== model) console.log('מודל פעיל:', model);
           lastGoodModel = model;
@@ -474,8 +488,8 @@ async function handleYemot(q) {
 }
 
 function waitResponse(first) {
-  if (musicReady) return `id_list_message=${first ? 't-רגע אני חושב.' : ''}f-wait_music`;
-  return `id_list_message=t-${first ? 'רגע אני חושב' : 'עוד רגע'}`;
+  if (musicReady) return `id_list_message=${first ? 't-רגע אני חושב.' : ''}f-wait_music&go_to_folder=/`;
+  return `id_list_message=t-${first ? 'רגע אני חושב' : 'עוד רגע'}&go_to_folder=/`;
 }
 
 async function getRecording(state, value) {
