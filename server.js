@@ -15,7 +15,7 @@ const GEMINI_KEYS = [...new Set([
 ].map(k => (k || '').trim()).filter(Boolean))];
 console.log('מפתחות Gemini מוגדרים:', GEMINI_KEYS.length);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '15000', 10);
+const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '10000', 10);
 const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD || '';   // אם לא הוגדר - מקש 5 לא פעיל
@@ -292,9 +292,13 @@ function cool(model, key, status) {
 let discoveredChat = [];
 let ttsModels = [];
 
-// סדר מודלים: קודם זה שעבד לאחרונה, אחר כך השאר; מדלגים על מודלים עמוסים
+// סדר מודלים; מדלגים על מודלים עמוסים
 function orderedModels() {
-  const all = [...new Set([lastGoodModel, GEMINI_MODEL, ...FALLBACK_MODELS, ...discoveredChat].filter(Boolean))];
+  // החזקים קודם (גרסה חדשה לפני ישנה); lite רק כמוצא אחרון, כי הוא מבין דיבור פחות טוב
+  const all = [...new Set([GEMINI_MODEL, ...FALLBACK_MODELS, ...discoveredChat])];
+  const rank = m => (m === GEMINI_MODEL ? 0 : /lite/.test(m) ? 3 : /preview|omni/.test(m) ? 2 : 1);
+  const ver = m => parseFloat((m.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0');
+  all.sort((a, b) => rank(a) - rank(b) || ver(b) - ver(a));
   const now = Date.now();
   const ready = all.filter(m => !(modelCooldown.get(m) > now));
   return ready.length ? ready : all;
@@ -439,13 +443,13 @@ async function askGemini(state, audio) {
         role: 'user',
         parts: [
           { inline_data: { mime_type: 'audio/wav', data: audio.toString('base64') } },
-          { text: 'זו הקלטה טלפונית של המתקשר. הקשב לה ישירות וענה על מה שהוא שואל, בהתאם להקשר של השיחה עד עכשיו. ' +
+          { text: 'זו ההקלטה הטלפונית החדשה של המתקשר, בעברית. הקשב לה ישירות וענה רק על מה שנשאל בה. היעזר בשיחה הקודמת רק אם זו שאלת המשך. אם לא הבנת בבירור מה נשאל, אל תנחש: בקש בנימוס לחזור על השאלה. ' +
                   'בשדה answer כתוב את התשובה. רק אחרי כן, בשדה question, כתוב בקצרה מה הבנת שנשאל (לתיעוד בלבד).' }
         ]
       }
     ],
     generationConfig: {
-      temperature: 0.6,
+      temperature: 0.2,
       maxOutputTokens: 1024,
       responseMimeType: 'application/json',
       responseSchema: {
@@ -625,6 +629,26 @@ function waitResponse(first) {
   return `id_list_message=${tts(first ? 'רגע אני חושב' : 'עוד רגע')}&go_to_folder=/`;
 }
 
+// אורך ועוצמה של ההקלטה - לאבחון בלבד, בלי לשמור את התוכן
+function audioStats(b) {
+  try {
+    if (b.toString('latin1', 0, 4) !== 'RIFF') return 'לא WAV, ' + b.length + ' בתים';
+    let o = 12, f = {};
+    while (o + 8 <= b.length) {
+      const id = b.toString('latin1', o, o + 4), n = b.readUInt32LE(o + 4);
+      if (id === 'fmt ') f = { codec: b.readUInt16LE(o + 8), ch: b.readUInt16LE(o + 10), rate: b.readUInt32LE(o + 12), bps: b.readUInt32LE(o + 16), bits: b.readUInt16LE(o + 22) };
+      if (id === 'data') {
+        const end = Math.min(b.length, o + 8 + n);
+        let sum = 0, peak = 0, c = 0;
+        if (f.codec === 1 && f.bits === 16) for (let k = o + 8; k + 1 < end; k += 2) { const v = b.readInt16LE(k); sum += v * v; peak = Math.max(peak, Math.abs(v)); c++; }
+        return JSON.stringify({ ...f, sec: +((end - o - 8) / f.bps).toFixed(1), peak, rms: c ? Math.round(Math.sqrt(sum / c)) : null });
+      }
+      o += 8 + n + (n % 2);
+    }
+  } catch (e) { return 'קריאה נכשלה: ' + e.message; }
+  return 'אין נתוני שמע';
+}
+
 async function getRecording(state, value) {
   console.log('ערך הקלטה מימות:', value);
   const candidates = [];
@@ -649,6 +673,7 @@ async function getRecording(state, value) {
     }
   }
   if (!audio) throw lastErr || new Error('ההקלטה לא נמצאה');
+  console.log('נתוני הקלטה:', audioStats(audio));
   deleteFile(usedPath);
   return audio;
 }
@@ -807,7 +832,7 @@ http.createServer(async (req, res) => {
       const q = Object.fromEntries(url.searchParams);
       if (req.method === 'POST') Object.assign(q, Object.fromEntries(new URLSearchParams(await readBody(req))));
       const { ApiPhone, ...rest } = q;
-      console.log('בקשה מימות:', JSON.stringify(rest));
+      console.log('בקשה מימות:', JSON.stringify(rest, (k, v) => (/^p\d+$/.test(k) ? '***' : v)));
       const out = await handleYemot(q);
       console.log('תשובה לימות:', out.slice(0, 300));
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
