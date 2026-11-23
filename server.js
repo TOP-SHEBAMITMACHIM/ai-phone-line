@@ -15,11 +15,11 @@ const GEMINI_KEYS = [...new Set([
 ].map(k => (k || '').trim()).filter(Boolean))];
 console.log('מפתחות Gemini מוגדרים:', GEMINI_KEYS.length);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '10000', 10);
+const CHAT_TIMEOUT = parseInt(process.env.CHAT_TIMEOUT || '15000', 10);
 const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const BYPASS_PASSWORD = process.env.BYPASS_PASSWORD || '';   // אם לא הוגדר - מקש 5 לא פעיל
-const MAX_WORDS = parseInt(process.env.MAX_WORDS || '80', 10);
+const MAX_WORDS = parseInt(process.env.MAX_WORDS || '200', 10);
 const BOT_STYLE = process.env.BOT_STYLE || 'ידידותי, חם ופשוט';
 const WELCOME = process.env.WELCOME_TEXT || 'שלום וברוכים הבאים לקו הבינה המלאכותית';
 const YEMOT_API = 'https://www.call2all.co.il/ym/api/';
@@ -29,7 +29,7 @@ const DATA_FILE = 'ivr2:/ai_data/users.ini';
 // ---------- הנחיות ל-Gemini ----------
 const BASE_RULES = `אתה עוזר קולי בקו טלפון. התשובה שלך תוקרא בקול למתקשר, לכן:
 - ענה בעברית בלבד, בשפה פשוטה וברורה, בלי סימני עיצוב, בלי כוכביות, בלי רשימות ובלי קישורים.
-- אורך התשובה עד ${MAX_WORDS} מילים.
+- תן תשובה מלאה ומפורטת: הסבר, הוסף פרטים חשובים ודוגמה כשזה עוזר. בשאלה שדורשת הסבר כתוב לפחות ${Math.round(MAX_WORDS / 2)} מילים, ולא יותר מ-${MAX_WORDS} מילים. רק בשאלה פשוטה מאוד, בסירוב או בבקשה לחזור על השאלה ענה בקצרה.
 - סגנון הדיבור: ${BOT_STYLE}.
 - אם לא הבנת את ההקלטה, בקש בנימוס לחזור על השאלה.`;
 
@@ -361,7 +361,7 @@ async function geminiSpeak(text) {
       const t0 = Date.now();
       const r = await fetchSafe(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST',
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(60000),
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({
           contents: [{ parts: [{ text }] }],   // רק הטקסט - אחרת המודל מקריא גם את ההנחיה
@@ -450,7 +450,7 @@ async function askGemini(state, audio) {
     ],
     generationConfig: {
       temperature: 0.2,
-      maxOutputTokens: 1024,
+      maxOutputTokens: 4096,
       responseMimeType: 'application/json',
       responseSchema: {
         type: 'OBJECT',
@@ -510,7 +510,11 @@ async function askGemini(state, audio) {
       if (!r.ok) throw new Error(`Gemini ${r.status}: ${j.error && j.error.message}`);
       const text = j.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
       let out;
-      try { out = JSON.parse(text); } catch { out = { question: '', answer: text }; }
+      try { out = JSON.parse(text); } catch {
+        // תשובה שנקטעה באמצע - לא מקריאים JSON שבור למתקשר
+        if (/^\s*[{[]/.test(text)) throw new Error('תשובה קטועה מ-Gemini');
+        out = { question: '', answer: text };
+      }
       if (!out.answer) throw new Error('תשובה ריקה מ-Gemini');
       // בזיכרון השיחה שומרים את ההקלטה המקורית (לא את התמלול) - 3 שאלות אחרונות
       state.history.push({ role: 'user', parts: [{ inline_data: { mime_type: 'audio/wav', data: audio.toString('base64') } }] });
@@ -560,7 +564,7 @@ async function handleYemot(q) {
 
   if (state.await === 'thinking') {
     if (!state.result) {
-      if (Date.now() - state.jobStart > 90000) {
+      if (Date.now() - state.jobStart > 180000) {
         state.result = { error: new Error('timeout') };
       } else {
         return waitResponse(false);

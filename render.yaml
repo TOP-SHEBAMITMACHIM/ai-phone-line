@@ -18,6 +18,6 @@ services:
       - key: BYPASS_PASSWORD
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       - key: MAX_WORDS
-        value: "80"
+        value: "200"
